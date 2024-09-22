@@ -1,0 +1,12 @@
+CampaignID,Name,Image,CTA,Status
+spotify,Spotify Campaign,https://example.com/images/spotify.png,Listen Now,ACTIVE
+duolingo,Duolingo Language Learning,https://example.com/images/duolingo.png,Start Learning,ACTIVE
+subwaysurfer,Subway Surfer Game,https://example.com/images/subwaysurfer.png,Play Now,ACTIVE
+netflix,Netflix Streaming Service,https://example.com/images/netflix.png,Watch Now,ACTIVE
+amazonprime,Amazon Prime Video,https://example.com/images/amazonprime.png,Start Watching,ACTIVE
+uber,Uber Rides,https://example.com/images/uber.png,Request a Ride,ACTIVE
+facebook,Facebook Social Network,https://example.com/images/facebook.png,Join Now,ACTIVE
+googlemaps,Google Maps Navigation,https://example.com/images/googlemaps.png,Get Directions,ACTIVE
+zoom,Zoom Video Conferencing,https://example.com/images/zoom.png,Join Meeting,ACTIVE
+whatsapp,WhatsApp Messaging,https://example.com/images/whatsapp.png,Send Message,ACTIVE
+tiktok,TikTok Social Media,https://example.com/images/tiktok.png,Watch Now,INACTIVE
