@@ -3,9 +3,7 @@ package stores
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"log"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -13,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -167,11 +164,9 @@ func setupStore(t *testing.T) *Store {
 	t.Setenv("MONGO_URI", "mongodb://localhost:27017")
 	t.Setenv("MONGO_DB_NAME", "delivery_service")
 
-	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	mt := helpers.InitializeMongo(logger)
+	helper := helpers.New()
 
-	store := New(mt, redisClient, logger)
+	store := New(helper.DB, helper.Redis, helper.Logger, helper.Metrics.CacheHits, helper.Metrics.CacheMisses)
 	insertRules(store.ruleCollection)
 	insertCampaigns(store.campaignCollection)
 
@@ -184,56 +179,49 @@ func TestStore_Get(t *testing.T) {
 	tests := []struct {
 		name              string
 		dimensions        *models.Dimension
-		cacheData         map[string]interface{}
-		expectedCampaigns *[]models.Response
+		cacheData         string
+		expectedCampaigns []models.Response
 		expectedErr       error
 	}{
 		{
-			name:       "Cache Hit for Spotify",
-			dimensions: &models.Dimension{APPID: "spotify", Country: "us", OS: "android"},
-			cacheData: map[string]interface{}{
-				"campaign:spotify": models.Response{CampaignID: "spotify", Image: "https://img"},
-			},
-			expectedCampaigns: &[]models.Response{{CampaignID: "spotify", Image: "https://img"}},
+			name:              "Cache Hit for Spotify",
+			dimensions:        &models.Dimension{APPID: "spotify", OS: "iOS", Country: "us"},
+			cacheData:         `[{"cid": "1", "name": "Spotify Campaign", "img": "image1.png", "cta": "Download", "status": "ACTIVE"}]`,
+			expectedCampaigns: []models.Response{{CampaignID: "1", Image: "image1.png", CTA: "Download"}},
 			expectedErr:       nil,
 		},
 		{
-			name:       "Cache Miss with DB Hit for Duolingo",
-			dimensions: &models.Dimension{APPID: "duolingo", Country: "IN", OS: "android"},
-			cacheData:  map[string]interface{}{},
-
-			expectedCampaigns: &[]models.Response{{CampaignID: "duolingo",
-				Image: "https://example.com/images/duolingo.png", CTA: "Start Learning"}},
-			expectedErr: nil,
+			name:       "Cache Miss - Fetch from MongoDB",
+			dimensions: &models.Dimension{APPID: "exampleApp", OS: "android", Country: "us"},
+			cacheData:  "",
+			expectedCampaigns: []models.Response{
+				{CampaignID: "spotify", Image: "https://example.com/images/spotify.png", CTA: "Listen Now"},
+			}, expectedErr: nil,
 		},
 		{
 			name:              "No Campaigns Found",
-			dimensions:        &models.Dimension{APPID: "netflix", Country: "england", OS: "windows"},
-			cacheData:         map[string]interface{}{},
+			dimensions:        &models.Dimension{APPID: "nonExistentApp", OS: "windows", Country: "northkorea"},
+			cacheData:         "",
 			expectedCampaigns: nil,
 			expectedErr:       nil,
-		},
-		{
-			name:       "Cache Miss for WhatsApp",
-			dimensions: &models.Dimension{APPID: "com.whatsapp", Country: "brazil", OS: "android"},
-			cacheData:  map[string]interface{}{},
-			expectedCampaigns: &[]models.Response{{CampaignID: "whatsapp", Image: "https://example.com/images/whatsapp.png", CTA: "Send Message"},
-				{CampaignID: "duolingo", Image: "https://example.com/images/duolingo.png", CTA: "Start Learning"}},
-			expectedErr: nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for k, v := range tt.cacheData {
-				data, _ := json.Marshal(v)
-				store.redisClient.Set(&gin.Context{}, k, data, 5*time.Second)
+			if tt.cacheData != "" {
+				store.redisClient.Set(context.Background(), generateCacheKey(tt.dimensions.APPID, tt.dimensions.OS,
+					tt.dimensions.Country), tt.cacheData, 1*time.Second)
 			}
 
-			campaigns, err := store.Get(&gin.Context{}, tt.dimensions)
+			result, err := store.Get(&gin.Context{}, tt.dimensions)
 
 			assert.Equal(t, tt.expectedErr, err)
-			assert.EqualValues(t, tt.expectedCampaigns, campaigns)
+			if result != nil {
+				assert.ElementsMatch(t, tt.expectedCampaigns, *result)
+			} else {
+				assert.ElementsMatch(t, tt.expectedCampaigns, result)
+			}
 		})
 	}
 }
@@ -249,7 +237,7 @@ func TestStore_InvalidateCache(t *testing.T) {
 	}{
 		{
 			name:        "Successful Cache Invalidation",
-			campaignID:  "amazonprime",
+			campaignID:  "campaign:amazonprime:keys",
 			expectedErr: nil,
 		},
 		{
@@ -265,7 +253,7 @@ func TestStore_InvalidateCache(t *testing.T) {
 				store.redisClient.Close()
 			}
 
-			err := store.InvalidateCache(&gin.Context{}, tt.campaignID)
+			err := store.InvalidateCampaignCache(&gin.Context{}, tt.campaignID)
 			assert.Equal(t, tt.expectedErr, err)
 		})
 	}

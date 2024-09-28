@@ -3,13 +3,13 @@ package stores
 import (
 	"context"
 	"encoding/json"
-	"github.com/prometheus/client_golang/prometheus"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 
@@ -35,6 +35,19 @@ func New(db *mongo.Database, redisClient *redis.Client, logger *slog.Logger, cac
 }
 
 func (s *Store) Get(ctx *gin.Context, dimensions *models.Dimension) (*[]models.Response, error) {
+	cacheKey := generateCacheKey(dimensions.APPID, dimensions.OS, dimensions.Country)
+
+	cachedCampaigns, err := s.redisClient.Get(ctx, cacheKey).Result()
+	if err == redis.Nil {
+		s.cacheMiss.WithLabelValues("campaigns").Inc()
+	} else if err == nil {
+		s.cacheHit.WithLabelValues("campaigns").Inc()
+		var campaigns []models.Response
+		if err := json.Unmarshal([]byte(cachedCampaigns), &campaigns); err == nil {
+			return &campaigns, nil
+		}
+	}
+
 	ruleFilter := bson.M{
 		"$and": []bson.M{
 			createDimensionRule("app", dimensions.APPID),
@@ -48,14 +61,12 @@ func (s *Store) Get(ctx *gin.Context, dimensions *models.Dimension) (*[]models.R
 		s.logger.Error("Error while Fetching Rules", "Error", err.Error())
 		return nil, &helpers.Error{Code: "Internal Server Error", StatusCode: http.StatusInternalServerError, Reason: err.Error()}
 	}
-
 	defer cur.Close(ctx)
 
 	var campaignIDs []string
 	for cur.Next(ctx) {
 		var rule models.TargetingRule
-		err := cur.Decode(&rule)
-		if err != nil {
+		if err := cur.Decode(&rule); err != nil {
 			s.logger.Error("Error decoding rule:", "Error", err.Error())
 			continue
 		}
@@ -66,39 +77,28 @@ func (s *Store) Get(ctx *gin.Context, dimensions *models.Dimension) (*[]models.R
 		return nil, nil
 	}
 
-	var cachedCampaigns []models.Response
-	var missingCampaignIDs []string
-	for _, campaignID := range campaignIDs {
-		cachedCampaign, err := s.redisClient.Get(ctx, "campaign:"+campaignID).Result()
-		if err == redis.Nil {
-			s.cacheMiss.WithLabelValues("campaigns").Inc()
-			missingCampaignIDs = append(missingCampaignIDs, campaignID)
-		} else if err == nil {
-			s.cacheHit.WithLabelValues("campaigns").Inc()
-			var campaign models.Response
-			if err := json.Unmarshal([]byte(cachedCampaign), &campaign); err == nil {
-				cachedCampaigns = append(cachedCampaigns, campaign)
+	freshCampaigns, err := s.FindActiveCampaignsByIDs(ctx, campaignIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	campaignJSON, err := json.Marshal(freshCampaigns)
+	if err == nil {
+		s.redisClient.Set(ctx, cacheKey, campaignJSON, 10*time.Hour)
+
+		for _, campaignID := range campaignIDs {
+			err = s.redisClient.SAdd(ctx, "campaign:"+campaignID+":keys", cacheKey).Err()
+			if err != nil {
+				s.logger.Error("Error storing cache key in Redis set", "Error", err.Error())
 			}
 		}
 	}
 
-	if len(missingCampaignIDs) > 0 {
-		freshCampaigns, err := s.FindActiveCampaignsByIDs(ctx, missingCampaignIDs)
-		if err != nil {
-			return nil, err
-		}
+	return freshCampaigns, nil
+}
 
-		for _, campaign := range *freshCampaigns {
-			campaignJSON, err := json.Marshal(campaign)
-			if err == nil {
-				s.redisClient.Set(ctx, "campaign:"+campaign.CampaignID, campaignJSON, 10*time.Minute)
-			}
-
-			cachedCampaigns = append(cachedCampaigns, campaign)
-		}
-	}
-
-	return &cachedCampaigns, nil
+func generateCacheKey(appID, os, country string) string {
+	return "campaign:" + appID + ":" + os + ":" + country
 }
 
 func createDimensionRule(dimension, value string) bson.M {
@@ -177,13 +177,31 @@ func (s *Store) FindActiveCampaignsByIDs(ctx context.Context, campaignIDs []stri
 	return &campaigns, nil
 }
 
-func (s *Store) InvalidateCache(ctx *gin.Context, campaignID string) error {
-	cacheKey := "campaign:" + campaignID
-
-	err := s.redisClient.Del(ctx, cacheKey).Err()
+func (s *Store) InvalidateCampaignCache(ctx context.Context, campaignID string) error {
+	cacheKeys, err := s.redisClient.SMembers(ctx, "campaign:"+campaignID+":keys").Result()
 	if err != nil {
-		s.logger.Error("Error while invalidating cache", "Error", err.Error())
+		s.logger.Error("Error fetching cache keys from Redis set", "campaignID", campaignID, "Error", err.Error())
 		return &helpers.Error{Code: "Internal Server Error", StatusCode: http.StatusInternalServerError, Reason: err.Error()}
+	}
+
+	if len(cacheKeys) == 0 {
+		s.logger.Info("No cache keys found for campaign", "campaignID", campaignID)
+		return nil
+	}
+
+	for _, cacheKey := range cacheKeys {
+		err = s.redisClient.Del(ctx, cacheKey).Err()
+		if err != nil {
+			s.logger.Error("Error deleting cache key", "cacheKey", cacheKey, "Error", err.Error())
+			continue
+		}
+		s.logger.Info("Cache key invalidated", "cacheKey", cacheKey)
+	}
+
+	err = s.redisClient.Del(ctx, "campaign:"+campaignID+":keys").Err()
+	if err != nil {
+		s.logger.Error("Error deleting Redis set for campaign", "campaignID", campaignID, "Error", err.Error())
+		return err
 	}
 
 	s.logger.Info("Cache invalidated for campaign", "campaignID", campaignID)
