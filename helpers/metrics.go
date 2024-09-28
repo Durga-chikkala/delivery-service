@@ -1,9 +1,13 @@
 package helpers
 
 import (
+	"sync"
+
 	"github.com/Durga-Chikkala/delivery-service/models"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+var metricsOnce sync.Once
 
 func NewMetrics() *models.Metrics {
 	m := &models.Metrics{
@@ -45,11 +49,13 @@ func NewMetrics() *models.Metrics {
 		),
 	}
 
-	prometheus.MustRegister(m.RequestCounter)
-	prometheus.MustRegister(m.RequestDuration)
-	prometheus.MustRegister(m.ErrorCounter)
-	prometheus.MustRegister(m.CacheHits)
-	prometheus.MustRegister(m.CacheMisses)
+	metricsOnce.Do(func() {
+		prometheus.MustRegister(m.RequestCounter)
+		prometheus.MustRegister(m.RequestDuration)
+		prometheus.MustRegister(m.ErrorCounter)
+		prometheus.MustRegister(m.CacheHits)
+		prometheus.MustRegister(m.CacheMisses)
+	})
 
 	return m
 }
